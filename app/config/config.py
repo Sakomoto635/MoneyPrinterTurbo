@@ -615,6 +615,9 @@ azure = _SynchronizedConfig(_cfg.get("azure", {}))
 siliconflow = _SynchronizedConfig(_cfg.get("siliconflow", {}))
 minimax_tts = _SynchronizedConfig(_cfg.get("minimax_tts", {}))
 elevenlabs = _SynchronizedConfig(_cfg.get("elevenlabs", {}))
+# Typecast 只读取非敏感参数（模型、情绪、语速等）；API Key 只从环境变量
+# TYPECAST_API_KEY 或项目根目录 .env 读取，不写入 config.toml。
+typecast = _cfg.get("typecast", {})
 chatterbox = _SynchronizedConfig(_cfg.get("chatterbox", {}))
 kokoro = _SynchronizedConfig(_cfg.get("kokoro", {}))
 fish_audio = _SynchronizedConfig(_cfg.get("fish_audio", {}))

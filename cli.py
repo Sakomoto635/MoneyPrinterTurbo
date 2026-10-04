@@ -482,7 +482,7 @@ Batch manifests:
             "[ui].voice_mode of 'none' or 'upload' resolves to no-voice "
             "instead, unless this option is given. "
             "Use 'no-voice' for silent output. Provider-specific identifiers "
-            "use prefixes such as gemini:, mimo:, elevenlabs:, chatterbox:, "
+            "use prefixes such as gemini:, mimo:, elevenlabs:, typecast:, chatterbox:, "
             "kokoro:, and voxcpm:"
         ),
     )

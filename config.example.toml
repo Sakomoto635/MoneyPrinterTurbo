@@ -612,6 +612,21 @@ music_base_url = "https://api.elevenlabs.io"
 music_model_id = "music_v2"
 music_timeout = 600
 
+[typecast]
+# Use voice names such as "typecast:tc_60e5426de8b95f1d3000d7b5".
+# The API key is NOT stored here. Set TYPECAST_API_KEY in the environment or
+# in a .env file at the project root (already ignored by git).
+# Every request is billed by text length; failed responses are never retried.
+model = "ssfm-v30"
+# Optional: "kor", "eng", ... (ISO 639-3). Empty means auto-detect.
+language = "kor"
+# Optional emotion preset for ssfm-v30: normal, happy, sad, angry, whisper,
+# toneup, tonedown. Empty means the voice default.
+emotion_preset = ""
+emotion_intensity = 1.0
+# Loudness normalization in LUFS (-14 is a common streaming target).
+target_lufs = -14
+
 [chatterbox]
 # OpenAI-compatible Chatterbox TTS server. The defaults target
 # travisvn/chatterbox-tts-api running locally on port 4123.

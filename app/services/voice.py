@@ -438,6 +438,30 @@ def get_elevenlabs_api_key() -> str:
     return configured_key or os.getenv("ELEVENLABS_API_KEY", "").strip()
 
 
+def is_typecast_voice(voice_name: str | None) -> bool:
+    return (voice_name or "").startswith("typecast:")
+
+
+def get_typecast_api_key() -> str:
+    """
+    Typecast API Key 只从环境变量或项目根目录的 .env 读取，避免写进 config.toml。
+    这里用 dotenv_values 只读取这一项，不会把 .env 的其他内容注入进程环境。
+    """
+    env_key = os.getenv("TYPECAST_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    env_file = os.path.join(utils.root_dir(), ".env")
+    if not os.path.isfile(env_file):
+        return ""
+    try:
+        from dotenv import dotenv_values
+
+        return str(dotenv_values(env_file).get("TYPECAST_API_KEY") or "").strip()
+    except Exception as exc:
+        logger.error(f"failed to read Typecast API key from .env: {type(exc).__name__}")
+        return ""
+
+
 def is_chatterbox_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("chatterbox:")
 
@@ -493,6 +517,8 @@ def is_azure_v1_voice(voice_name: str | None) -> bool:
     if is_minimax_voice(name):
         return False
     if is_elevenlabs_voice(name):
+        return False
+    if is_typecast_voice(name):
         return False
     if is_chatterbox_voice(name):
         return False
@@ -671,6 +697,13 @@ def _single_tts(
         else:
             logger.error(f"Invalid elevenlabs voice name format: {voice_name}")
             return None
+    elif is_typecast_voice(voice_name):
+        # 格式: typecast:{voice_id}，voice_id 以 tc_（内置）或 uc_（克隆）开头
+        voice_id = voice_name.split(":", 1)[1].strip()
+        if voice_id.startswith(("tc_", "uc_")):
+            return typecast_tts(text, voice_id, voice_file, voice_rate, voice_volume)
+        logger.error(f"Invalid typecast voice name format: {voice_name}")
+        return None
     elif is_chatterbox_voice(voice_name):
         # 格式: chatterbox:<voice>，voice 可带显示用的 -Female/-Male 后缀
         parts = voice_name.split(":", 1)
@@ -2493,6 +2526,180 @@ def elevenlabs_tts(
                     os.remove(temp_path)
                 except OSError as exc:
                     logger.warning(f"failed to remove ElevenLabs TTS temp file: {exc}")
+            if response is not None:
+                response.close()
+
+    return None
+
+
+_TYPECAST_TTS_URL = "https://api.typecast.ai/v1/text-to-speech/with-timestamps"
+_TYPECAST_TTS_MAX_TEXT_CHARS = 2000
+_TYPECAST_TTS_MAX_RESPONSE_BYTES = 80 * 1024 * 1024
+
+
+def _build_typecast_payload(text: str, voice_id: str, voice_rate: float) -> dict:
+    settings = config.typecast
+    model = str(settings.get("model", "ssfm-v30") or "ssfm-v30").strip()
+    output = {
+        "audio_format": "mp3",
+        # MoneyPrinterTurbo 的语速倍率直接映射到 Typecast tempo，并夹在官方允许范围内。
+        "audio_tempo": min(2.0, max(0.5, float(voice_rate or 1.0))),
+    }
+    target_lufs = settings.get("target_lufs", -14)
+    if target_lufs not in (None, ""):
+        output["target_lufs"] = float(target_lufs)
+    payload = {"voice_id": voice_id, "text": text, "model": model, "output": output}
+
+    language = str(settings.get("language", "") or "").strip()
+    if language:
+        payload["language"] = language
+
+    emotion_preset = str(settings.get("emotion_preset", "") or "").strip()
+    if emotion_preset:
+        intensity = float(settings.get("emotion_intensity", 1.0) or 1.0)
+        prompt = {"emotion_preset": emotion_preset, "emotion_intensity": intensity}
+        if model != "ssfm-v21":
+            prompt["emotion_type"] = "preset"
+        payload["prompt"] = prompt
+    return payload
+
+
+def _typecast_words_to_submaker(words: list, text: str, audio_duration: float) -> SubMaker:
+    """
+    把 Typecast 返回的逐词时间戳写进旧版 `subs/offset` 结构（单位 100ns），
+    这样后续 subtitle_provider=edge 的断句聚合逻辑可以直接生成精确字幕。
+    时间戳缺失或格式异常时，退回按全文均分的兼容方案。
+    """
+    sub_maker = ensure_legacy_submaker_fields(SubMaker())
+    subs, offsets = [], []
+    for word in words or []:
+        if not isinstance(word, dict):
+            continue
+        word_text = str(word.get("text") or "")
+        try:
+            start = float(word.get("start"))
+            end = float(word.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if not word_text.strip() or not math.isfinite(start) or not math.isfinite(end):
+            continue
+        subs.append(word_text.strip())
+        offsets.append((int(start * 10000000), int(max(end, start) * 10000000)))
+
+    if not subs:
+        logger.warning("typecast returned no usable word timestamps; using even split")
+        return populate_legacy_submaker_with_full_text(sub_maker, text, audio_duration)
+
+    sub_maker.subs = subs
+    sub_maker.offset = offsets
+    return sub_maker
+
+
+def typecast_tts(
+    text: str,
+    voice_id: str,
+    voice_file: str,
+    voice_rate: float = 1.0,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """
+    调用 Typecast 带时间戳的 TTS 接口。每次请求都按字数计费，因此只有在
+    连接尚未建立（ConnectTimeout）时才重试；收到任何响应后都不再重发。
+    voice_volume 由后续视频合成阶段统一处理，这里只做响度归一化。
+    """
+    text = (text or "").strip()
+    if not text:
+        logger.error("Typecast TTS text is empty")
+        return None
+    if len(text) > _TYPECAST_TTS_MAX_TEXT_CHARS:
+        logger.error(
+            f"Typecast TTS text has {len(text)} characters; the API limit is "
+            f"{_TYPECAST_TTS_MAX_TEXT_CHARS}"
+        )
+        return None
+
+    api_key = get_typecast_api_key()
+    if not api_key:
+        logger.error("Typecast API key is not set (TYPECAST_API_KEY in .env)")
+        return None
+
+    payload = _build_typecast_payload(text, voice_id, voice_rate)
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+
+    for i in range(3):
+        response = None
+        temp_path = None
+        try:
+            logger.info(
+                f"start typecast tts, voice_id: {voice_id}, model: {payload['model']}, "
+                f"characters: {len(text)}, try: {i + 1}"
+            )
+            ensure_file_path_exists(voice_file)
+            response = requests.post(
+                _TYPECAST_TTS_URL,
+                params={"granularity": "word"},
+                json=payload,
+                headers=headers,
+                timeout=(10, 180),
+                allow_redirects=False,
+            )
+            if response.status_code != 200:
+                # 不打印响应头，避免任何认证信息进入日志；正文只截取前 300 字。
+                logger.error(
+                    f"Typecast TTS failed (not retried to avoid double billing): "
+                    f"status {response.status_code}, body: {response.text[:300]}"
+                )
+                return None
+            if len(response.content) > _TYPECAST_TTS_MAX_RESPONSE_BYTES:
+                logger.error("Typecast TTS response exceeds the 80 MB limit")
+                return None
+
+            data = response.json()
+            audio_b64 = data.get("audio") if isinstance(data, dict) else None
+            if not isinstance(audio_b64, str) or not audio_b64:
+                logger.error("Typecast TTS returned no audio data")
+                return None
+
+            descriptor, temp_path = tempfile.mkstemp(
+                prefix=".typecast-tts-",
+                suffix=os.path.splitext(voice_file)[1] or ".mp3",
+                dir=os.path.dirname(os.path.abspath(voice_file)),
+            )
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(base64.b64decode(audio_b64))
+
+            audio_clip = AudioFileClip(temp_path)
+            try:
+                audio_duration = float(audio_clip.duration)
+            finally:
+                audio_clip.close()
+            if not math.isfinite(audio_duration) or audio_duration <= 0:
+                logger.error("Typecast TTS returned audio with invalid duration")
+                return None
+
+            os.replace(temp_path, voice_file)
+            temp_path = None
+            logger.success(
+                f"typecast tts succeeded: {voice_file}, duration: {audio_duration:.2f}s"
+            )
+            return _typecast_words_to_submaker(data.get("words"), text, audio_duration)
+        except requests.exceptions.ConnectTimeout as e:
+            logger.warning(f"typecast tts could not connect, retrying: {type(e).__name__}")
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                "typecast tts result is unconfirmed after a transport error; "
+                f"stop paid retries: {type(e).__name__}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"typecast tts failed: {type(e).__name__}: {e}")
+            return None
+        finally:
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except OSError as exc:
+                    logger.warning(f"failed to remove Typecast TTS temp file: {exc}")
             if response is not None:
                 response.close()
 
