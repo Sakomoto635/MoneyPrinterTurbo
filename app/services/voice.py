@@ -1,10 +1,13 @@
 import asyncio
 import base64
+import datetime
+import hashlib
 import io
 import inspect
 import json
 import math
 import os
+import pathlib
 import queue
 import re
 import shutil
@@ -2536,6 +2539,42 @@ _TYPECAST_TTS_URL = "https://api.typecast.ai/v1/text-to-speech/with-timestamps"
 _TYPECAST_TTS_MAX_TEXT_CHARS = 2000
 _TYPECAST_TTS_MAX_RESPONSE_BYTES = 80 * 1024 * 1024
 
+# 유료 음성 사용량 기록. 옛 제작 방식(tools/shorts_factory/build_short.py)은
+# 글자 수를 기록했는데 이쪽 새 방식은 안 해서, 2026-10-05 기준으로 새 방식
+# 지출이 어디에도 안 남고 있었다. 분석가가 주간 리포트의 "버려진 타입캐스트
+# 글자 수"를 "확인 못 함"으로 적게 된 원인이다(HYE-44). 두 방식이 같은 장부에
+# 쌓이게 맞춘다. 세는 도구는 tools/shorts_factory/tts_waste.py.
+# 경로는 이 파일 위치 기준이다 — 자동 실행 때 HOME 이 임시 폴더로 바뀌어도
+# 같은 곳을 본다(2026-09-27 에 HOME 때문에 제작이 멈춘 적이 있다).
+_TTS_USAGE_LOG = (
+    pathlib.Path(__file__).resolve().parents[4] / "tools" / "shorts_factory" / "tts_usage.jsonl"
+)
+
+
+def _log_typecast_usage(text: str, voice_id: str, model: str) -> None:
+    """결제가 확정된 순간(응답 200)에 글자 수를 적는다.
+
+    기록이 실패해도 제작은 멈추지 않는다 — 다만 조용히 넘기지 않고 경고를 남긴다.
+    `code` 는 어느 편인지다. 돌릴 때 DJHM_EPISODE_CODE 환경변수로 넘긴다.
+    """
+    try:
+        _TTS_USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _TTS_USAGE_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "when": datetime.datetime.now().isoformat(timespec="seconds"),
+                "code": os.environ.get("DJHM_EPISODE_CODE", "?"),
+                "model": model,
+                "voice": voice_id,
+                "chars": len(text),
+                "chars_no_space": len(text.replace(" ", "")),
+                "text_sha": hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16],
+                "billed": True,
+                "seconds": None,
+                "engine": "MoneyPrinterTurbo",
+            }, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning(f"타입캐스트 사용량 기록 실패(제작은 계속): {type(exc).__name__}: {exc}")
+
 
 def _build_typecast_payload(text: str, voice_id: str, voice_rate: float) -> dict:
     settings = config.typecast
@@ -2650,6 +2689,10 @@ def typecast_tts(
                     f"status {response.status_code}, body: {response.text[:300]}"
                 )
                 return None
+            # 응답이 돌아온 순간 글자 수만큼 결제가 끝났다. 뒤에서 무엇이
+            # 실패하든 돈은 나갔으므로, 더 진행하기 전에 먼저 적는다.
+            _log_typecast_usage(text, voice_id, payload["model"])
+
             if len(response.content) > _TYPECAST_TTS_MAX_RESPONSE_BYTES:
                 logger.error("Typecast TTS response exceeds the 80 MB limit")
                 return None
