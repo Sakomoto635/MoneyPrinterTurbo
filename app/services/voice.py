@@ -2546,34 +2546,97 @@ _TYPECAST_TTS_MAX_RESPONSE_BYTES = 80 * 1024 * 1024
 # 쌓이게 맞춘다. 세는 도구는 tools/shorts_factory/tts_waste.py.
 # 경로는 이 파일 위치 기준이다 — 자동 실행 때 HOME 이 임시 폴더로 바뀌어도
 # 같은 곳을 본다(2026-09-27 에 HOME 때문에 제작이 멈춘 적이 있다).
-_TTS_USAGE_LOG = (
-    pathlib.Path(__file__).resolve().parents[4] / "tools" / "shorts_factory" / "tts_usage.jsonl"
+#
+# 단, "위로 네 단계" 같은 고정 계산은 쓰지 않는다. 저장소가 다른 깊이로 옮겨지거나
+# 새로 내려받아지면 그 계산이 엉뚱한 폴더를 가리키는데, mkdir(parents=True) 가
+# 그 폴더를 조용히 만들어 거기에 적는다. 실패한 게 없으니 경고도 안 뜬다 — 돈은
+# 나갔는데 tts_waste.py 가 "쓴 글자 0자"로 보고한다. 숫자가 없는 게 아니라
+# 거짓이 된다. (2026-10-05 총괄 지적, 재현 확인)
+# 그래서 **이미 존재하는** 장부 폴더만 받아들이고, 못 찾으면 소리를 낸다.
+_TTS_LEDGER_DIR_RELPATH = pathlib.Path("tools") / "shorts_factory"
+_TTS_USAGE_FILENAME = "tts_usage.jsonl"
+_TTS_USAGE_LOG_ENV = "DJHM_TTS_USAGE_LOG"
+# 이름만 같은 빈 폴더를 장부로 착각하지 않게, 우리 폴더라는 증거가 하나는 있어야 한다.
+# (시험 중에 이름만 같은 폴더를 실제로 집어 갔다. 2026-10-05)
+_TTS_LEDGER_MARKERS = (_TTS_USAGE_FILENAME, "voices.json", "tts_waste.py")
+# 본 장부를 못 찾았을 때 돈 기록을 버리지 않고 담아 두는 곳(저장소 안이라 항상 안전하다).
+_TTS_ORPHAN_LOG = (
+    pathlib.Path(__file__).resolve().parents[2] / "storage" / "tts_usage_장부못찾음.jsonl"
 )
+
+
+def _resolve_tts_usage_log() -> tuple:
+    """쓸 장부 경로와, 문제가 있으면 그 이유를 돌려준다.
+
+    찾는 순서: ① `DJHM_TTS_USAGE_LOG` 환경변수 → ② 이 파일에서 위로 올라가며
+    **실제로 있는** `tools/shorts_factory` 폴더 → ③ 못 찾으면 고아 장부.
+    폴더를 새로 만들어 가며 찾지 않는다. 그게 이 버그의 원인이었다.
+    """
+    override = os.environ.get(_TTS_USAGE_LOG_ENV, "").strip()
+    if override:
+        target = pathlib.Path(override).expanduser()
+        if target.parent.is_dir():
+            return target, ""
+        return _TTS_ORPHAN_LOG, (
+            f"{_TTS_USAGE_LOG_ENV} 가 가리키는 폴더가 없다: {target.parent}"
+        )
+
+    here = pathlib.Path(__file__).resolve()
+    for base in here.parents:
+        candidate = base / _TTS_LEDGER_DIR_RELPATH
+        if candidate.is_dir() and any((candidate / m).exists() for m in _TTS_LEDGER_MARKERS):
+            return candidate / _TTS_USAGE_FILENAME, ""
+
+    return _TTS_ORPHAN_LOG, (
+        f"장부 폴더 '{_TTS_LEDGER_DIR_RELPATH}' 를 {here.parent} 위쪽 어디에서도 못 찾았다"
+        f" (찾는 표시: {', '.join(_TTS_LEDGER_MARKERS)})"
+    )
 
 
 def _log_typecast_usage(text: str, voice_id: str, model: str) -> None:
     """결제가 확정된 순간(응답 200)에 글자 수를 적는다.
 
-    기록이 실패해도 제작은 멈추지 않는다 — 다만 조용히 넘기지 않고 경고를 남긴다.
+    기록이 실패해도 제작은 멈추지 않는다(돈은 이미 나갔으니 멈추면 손해만 커진다).
+    다만 **조용히 넘기지 않는다** — 본 장부를 못 찾으면 크게 경고하고, 기록은
+    고아 장부에 담아 둔다. 그것마저 안 되면 줄 전체를 로그에 찍어 남긴다.
     `code` 는 어느 편인지다. 돌릴 때 DJHM_EPISODE_CODE 환경변수로 넘긴다.
     """
+    line = json.dumps({
+        "when": datetime.datetime.now().isoformat(timespec="seconds"),
+        "code": os.environ.get("DJHM_EPISODE_CODE", "?"),
+        "model": model,
+        "voice": voice_id,
+        "chars": len(text),
+        "chars_no_space": len(text.replace(" ", "")),
+        "text_sha": hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16],
+        "billed": True,
+        "seconds": None,
+        "engine": "MoneyPrinterTurbo",
+    }, ensure_ascii=False)
+
+    target, problem = _resolve_tts_usage_log()
+    if problem:
+        logger.error(
+            "타입캐스트 글자 수 장부를 못 찾았다 — 손대지 않으면 이 줄은 집계에서 빠진다. "
+            f"이유: {problem}. 일단 '{target}' 에 담아 둔다. "
+            f"고치는 법: 환경변수 {_TTS_USAGE_LOG_ENV} 에 tts_usage.jsonl 의 전체 경로를 주고 "
+            "다시 돌리거나, 이 파일의 줄을 본 장부에 옮겨 붙인다."
+        )
+
     try:
-        _TTS_USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _TTS_USAGE_LOG.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "when": datetime.datetime.now().isoformat(timespec="seconds"),
-                "code": os.environ.get("DJHM_EPISODE_CODE", "?"),
-                "model": model,
-                "voice": voice_id,
-                "chars": len(text),
-                "chars_no_space": len(text.replace(" ", "")),
-                "text_sha": hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16],
-                "billed": True,
-                "seconds": None,
-                "engine": "MoneyPrinterTurbo",
-            }, ensure_ascii=False) + "\n")
+        if problem:
+            # 고아 장부는 저장소 안(storage/)이라 만들어도 엉뚱한 곳이 아니다.
+            target.parent.mkdir(parents=True, exist_ok=True)
+        elif not target.parent.is_dir():
+            raise FileNotFoundError(f"장부 폴더가 사라졌다: {target.parent}")
+        with target.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
     except Exception as exc:
-        logger.warning(f"타입캐스트 사용량 기록 실패(제작은 계속): {type(exc).__name__}: {exc}")
+        # 마지막 수단 — 파일에 못 적어도 돈 기록이 완전히 사라지지는 않게 로그에 남긴다.
+        logger.error(
+            f"타입캐스트 사용량 기록 실패(제작은 계속): {type(exc).__name__}: {exc} "
+            f"| 손으로 장부에 옮길 줄: {line}"
+        )
 
 
 def _build_typecast_payload(text: str, voice_id: str, voice_rate: float) -> dict:
